@@ -13,6 +13,7 @@ import random
 import itertools
 import colorsys
 
+import cv2
 import numpy as np
 from skimage.measure import find_contours
 import matplotlib.pyplot as plt
@@ -279,11 +280,16 @@ def draw_box(image, box, color):
     return image
 
 
-def display_top_masks(image, mask, class_ids, class_names, limit=4):
+def display_top_masks(image, mask, class_ids, class_names, shapes):
     """Display the given image and the top few class masks."""
+    limit = 4
     to_display = []
     titles = []
-    to_display.append(image)
+    annotated_image = np.copy(image)
+    for shape in shapes:
+        x, y, s, _ = shape[2]
+        cv2.rectangle(annotated_image, (x - s, y - s), (x + s, y + s), (1, 0, 0), 2)
+    to_display.append(annotated_image)
     titles.append("H x W={}x{}".format(image.shape[0], image.shape[1]))
     # Pick top prominent classes in this image
     unique_class_ids = np.unique(class_ids)

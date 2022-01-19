@@ -20,7 +20,7 @@ import tensorflow as tf
 import keras
 import keras.backend as K
 import keras.layers as KL
-import keras.engine as KE
+import keras.engine.topology as KE
 import keras.models as KM
 
 from mrcnn import utils
@@ -48,6 +48,19 @@ def log(text, array=None):
             text += ("min: {:10}  max: {:10}".format("",""))
         text += "  {}".format(array.dtype)
     print(text)
+
+
+class AnchorsLayer(KL.Layer):
+    def __init__(self, anchors, name="anchors", **kwargs):
+        super(AnchorsLayer, self).__init__(name=name, **kwargs)
+        self.anchors = tf.Variable(anchors)
+
+    def call(self, dummy):
+        return self.anchors
+
+    def get_config(self):
+        config = super(AnchorsLayer, self).get_config()
+        return config
 
 
 class BatchNorm(KL.BatchNormalization):
@@ -338,7 +351,7 @@ class ProposalLayer(KE.Layer):
 
 def log2_graph(x):
     """Implementation of Log2. TF doesn't have a native implementation."""
-    return tf.log(x) / tf.log(2.0)
+    return tf.math.log(x) / tf.math.log(2.0)
 
 
 class PyramidROIAlign(KE.Layer):
@@ -550,12 +563,12 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     # Positive ROIs
     positive_count = int(config.TRAIN_ROIS_PER_IMAGE *
                          config.ROI_POSITIVE_RATIO)
-    positive_indices = tf.random_shuffle(positive_indices)[:positive_count]
+    positive_indices = tf.random.shuffle(positive_indices)[:positive_count]
     positive_count = tf.shape(positive_indices)[0]
     # Negative ROIs. Add enough to maintain positive:negative ratio.
     r = 1.0 / config.ROI_POSITIVE_RATIO
     negative_count = tf.cast(r * tf.cast(positive_count, tf.float32), tf.int32) - positive_count
-    negative_indices = tf.random_shuffle(negative_indices)[:negative_count]
+    negative_indices = tf.random.shuffle(negative_indices)[:negative_count]
     # Gather selected ROIs
     positive_rois = tf.gather(proposals, positive_indices)
     negative_rois = tf.gather(proposals, negative_indices)
@@ -948,7 +961,7 @@ def fpn_classifier_graph(rois, feature_maps, image_meta,
                            name='mrcnn_bbox_fc')(shared)
     # Reshape to [batch, num_rois, NUM_CLASSES, (dy, dx, log(dh), log(dw))]
     s = K.int_shape(x)
-    mrcnn_bbox = KL.Reshape((s[1], num_classes, 4), name="mrcnn_bbox")(x)
+    mrcnn_bbox = KL.Reshape((-1, num_classes, 4), name="mrcnn_bbox")(x)
 
     return mrcnn_class_logits, mrcnn_probs, mrcnn_bbox
 
@@ -1846,6 +1859,7 @@ class MaskRCNN():
 
         # Image size must be dividable by 2 multiple times
         h, w = config.IMAGE_SHAPE[:2]
+        print("Image sizes", h, w)
         if h / 2**6 != int(h / 2**6) or w / 2**6 != int(w / 2**6):
             raise Exception("Image size must be dividable by 2 at least 6 times "
                             "to avoid fractions when downscaling and upscaling."
@@ -1872,8 +1886,7 @@ class MaskRCNN():
             input_gt_boxes = KL.Input(
                 shape=[None, 4], name="input_gt_boxes", dtype=tf.float32)
             # Normalize coordinates
-            gt_boxes = KL.Lambda(lambda x: norm_boxes_graph(
-                x, K.shape(input_image)[1:3]))(input_gt_boxes)
+            gt_boxes = KL.Lambda(lambda x: norm_boxes_graph2(x))([input_gt_boxes, input_image])
             # 3. GT Masks (zero padded)
             # [batch, height, width, MAX_GT_INSTANCES]
             if config.USE_MINI_MASK:
@@ -1931,7 +1944,8 @@ class MaskRCNN():
             # TODO: can this be optimized to avoid duplicating the anchors?
             anchors = np.broadcast_to(anchors, (config.BATCH_SIZE,) + anchors.shape)
             # A hack to get around Keras's bad support for constants
-            anchors = KL.Lambda(lambda x: tf.Variable(anchors), name="anchors")(input_image)
+            anchors = AnchorsLayer(anchors, name="anchors")(input_image)
+            # anchors = KL.Lambda(lambda x: tf.Variable(anchors), name="anchors")(input_image)
         else:
             anchors = input_anchors
 
@@ -2101,11 +2115,7 @@ class MaskRCNN():
         import h5py
         # Conditional import to support versions of Keras before 2.2
         # TODO: remove in about 6 months (end of 2018)
-        try:
-            from keras.engine import saving
-        except ImportError:
-            # Keras before 2.2 used the 'topology' namespace.
-            from keras.engine import topology as saving
+        from tensorflow.python.keras.saving import hdf5_format
 
         if exclude:
             by_name = True
@@ -2126,10 +2136,11 @@ class MaskRCNN():
         if exclude:
             layers = filter(lambda l: l.name not in exclude, layers)
 
+        # keras_model.load_weights(filepath, by_name=by_name)
         if by_name:
-            saving.load_weights_from_hdf5_group_by_name(f, layers)
+            hdf5_format.load_weights_from_hdf5_group_by_name(f, layers)
         else:
-            saving.load_weights_from_hdf5_group(f, layers)
+            hdf5_format.load_weights_from_hdf5_group(f, layers)
         if hasattr(f, 'close'):
             f.close()
 
@@ -2160,8 +2171,8 @@ class MaskRCNN():
             clipnorm=self.config.GRADIENT_CLIP_NORM)
         # Add Losses
         # First, clear previously set losses to avoid duplication
-        self.keras_model._losses = []
-        self.keras_model._per_input_losses = {}
+        # self.keras_model._losses = []
+        # self.keras_model._per_input_losses = {}
         loss_names = [
             "rpn_class_loss",  "rpn_bbox_loss",
             "mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss"]
@@ -2849,6 +2860,12 @@ def norm_boxes_graph(boxes, shape):
     scale = tf.concat([h, w, h, w], axis=-1) - tf.constant(1.0)
     shift = tf.constant([0., 0., 1., 1.])
     return tf.divide(boxes - shift, scale)
+
+
+def norm_boxes_graph2(x):
+    boxes,tensor_for_shape = x
+    shape = tf.shape(tensor_for_shape)[1:3]
+    return norm_boxes_graph(boxes,shape)
 
 
 def denorm_boxes_graph(boxes, shape):
